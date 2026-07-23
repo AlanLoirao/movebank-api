@@ -174,62 +174,85 @@ async def receber_webhook_moveo(request: Request) -> dict[str, Any]:
 
     print("\n========== WEBHOOK MOVEO ==========")
     print("Payload recebido:", payload)
-    print("Headers recebidos:", dict(request.headers))
     print("===================================\n")
 
-    cpf = localizar_cpf_no_payload(payload)
+    # Tenta obter o CPF salvo no ID externo.
+    contexto = payload.get("context", {})
+    usuario = contexto.get("user", {})
 
-    if cpf is None:
+    cpf = limpar_cpf(str(usuario.get("external_id", "")))
+
+    # Caso não esteja no external_id, procura no JSON inteiro.
+    if len(cpf) != 11:
+        cpf_encontrado = localizar_cpf_no_payload(payload)
+        cpf = cpf_encontrado or ""
+
+    if len(cpf) != 11:
         return {
-            "status": "aguardando_identificacao",
-            "mensagem": (
-                "Olá! Para consultar suas condições de negociação, "
-                "informe um CPF de teste com 11 números."
-            ),
-            "recebido_em": datetime.now(timezone.utc).isoformat(),
+            "responses": [
+                {
+                    "type": "text",
+                    "texts": [
+                        "Não consegui identificar o CPF informado. "
+                        "Digite apenas os 11 números do CPF."
+                    ],
+                }
+            ],
+            "context": {
+                "consulta_status": "cpf_invalido",
+            },
         }
 
     cliente = clientes.get(cpf)
 
     if cliente is None:
         return {
-            "status": "cliente_nao_encontrado",
-            "cpf_consultado": cpf,
-            "mensagem": (
-                "Não localizei uma negociação disponível para o CPF informado. "
-                "Posso encaminhar o atendimento para um especialista."
-            ),
-            "recebido_em": datetime.now(timezone.utc).isoformat(),
+            "responses": [
+                {
+                    "type": "text",
+                    "texts": [
+                        "Não localizei uma negociação para o CPF informado. "
+                        "Posso encaminhar você para um especialista."
+                    ],
+                }
+            ],
+            "context": {
+                "consulta_status": "cliente_nao_encontrado",
+                "cpf_consultado": cpf,
+            },
         }
 
     oferta = calcular_oferta(cliente)
 
     parcelas_texto = ", ".join(
-        (
-            f"{opcao['quantidade']}x de "
-            f"{formatar_moeda(opcao['valor_parcela'])}"
-        )
+        f"{opcao['quantidade']}x de "
+        f"{formatar_moeda(opcao['valor_parcela'])}"
         for opcao in oferta["parcelamentos"]
     )
 
-    mensagem_cliente = (
+    mensagem = (
         f"Olá, {cliente['nome']}. Localizei um débito de "
         f"{formatar_moeda(cliente['valor_divida'])}, com "
         f"{cliente['dias_atraso']} dias de atraso. "
-        f"Para pagamento à vista, há uma condição simulada de "
-        f"{formatar_moeda(oferta['valor_avista'])}, correspondente a "
+        f"Para pagamento à vista, o valor simulado é "
+        f"{formatar_moeda(oferta['valor_avista'])}, com "
         f"{oferta['desconto_avista_percentual']}% de desconto. "
-        f"As opções de parcelamento disponíveis são: {parcelas_texto}."
+        f"Também temos: {parcelas_texto}. "
+        "Qual opção você prefere?"
     )
 
     return {
-        "status": "cliente_localizado",
-        "mensagem": mensagem_cliente,
-        "cliente": {
-            "nome": cliente["nome"],
-            "cpf_mascarado": f"***.***.***-{cpf[-2:]}",
-            "dias_atraso": cliente["dias_atraso"],
+        "responses": [
+            {
+                "type": "text",
+                "texts": [mensagem],
+            }
+        ],
+        "context": {
+            "consulta_status": "cliente_localizado",
+            "cliente_nome": cliente["nome"],
+            "cpf_consultado": cpf,
+            "valor_divida": cliente["valor_divida"],
+            "valor_avista": oferta["valor_avista"],
         },
-        "oferta": oferta,
-        "recebido_em": datetime.now(timezone.utc).isoformat(),
     }
