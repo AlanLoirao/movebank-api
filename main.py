@@ -4,12 +4,19 @@ import re
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
 
 app = FastAPI(
     title="MoveBank Recovery API",
     description="API simulada para integração com o agente MoveBank Recovery AI",
-    version="1.1.0",
+    version="1.2.0",
 )
+
+
+# =========================================================
+# BASE SIMULADA DE CLIENTES
+# =========================================================
 
 clientes = {
     "12345678900": {
@@ -54,14 +61,32 @@ clientes = {
     },
 }
 
+
+# =========================================================
+# MODELOS DO PAYLOAD DA MOVEO
+# =========================================================
+
+class MoveoUser(BaseModel):
+    external_id: str | None = None
+
+
+class MoveoContext(BaseModel):
+    user: MoveoUser | None = None
+
+
+class MoveoWebhookPayload(BaseModel):
+    context: MoveoContext = Field(default_factory=MoveoContext)
+
+
+# =========================================================
+# FUNÇÕES AUXILIARES
+# =========================================================
+
 def limpar_cpf(valor: str) -> str:
     return "".join(caractere for caractere in valor if caractere.isdigit())
 
 
 def localizar_cpf_em_texto(texto: str) -> str | None:
-    """
-    Localiza um CPF com ou sem pontuação dentro de um texto.
-    """
     padrao = r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"
     resultado = re.search(padrao, texto)
 
@@ -72,22 +97,24 @@ def localizar_cpf_em_texto(texto: str) -> str | None:
 
 
 def localizar_cpf_no_payload(valor: Any) -> str | None:
-    """
-    Percorre recursivamente o JSON recebido da Moveo,
-    procurando um CPF em qualquer campo.
-    """
     if isinstance(valor, str):
         return localizar_cpf_em_texto(valor)
 
     if isinstance(valor, dict):
-        # Primeiro procura em campos que provavelmente contêm o CPF.
-        for chave in ("cpf", "message", "mensagem", "text", "texto", "content"):
+        for chave in (
+            "cpf",
+            "external_id",
+            "message",
+            "mensagem",
+            "text",
+            "texto",
+            "content",
+        ):
             if chave in valor:
                 cpf = localizar_cpf_no_payload(valor[chave])
                 if cpf:
                     return cpf
 
-        # Depois procura nos demais campos.
         for conteudo in valor.values():
             cpf = localizar_cpf_no_payload(conteudo)
             if cpf:
@@ -115,15 +142,21 @@ def calcular_oferta(cliente: dict[str, Any]) -> dict[str, Any]:
     valor_divida = cliente["valor_divida"]
     desconto = cliente["desconto_avista_percentual"]
 
-    valor_avista = round(valor_divida * (1 - desconto / 100), 2)
+    valor_avista = round(
+        valor_divida * (1 - desconto / 100),
+        2,
+    )
 
-    opcoes_parcelamento = []
+    parcelamentos = []
 
     for quantidade in cliente["parcelas_disponiveis"]:
-        opcoes_parcelamento.append(
+        parcelamentos.append(
             {
                 "quantidade": quantidade,
-                "valor_parcela": round(valor_divida / quantidade, 2),
+                "valor_parcela": round(
+                    valor_divida / quantidade,
+                    2,
+                ),
             }
         )
 
@@ -131,16 +164,21 @@ def calcular_oferta(cliente: dict[str, Any]) -> dict[str, Any]:
         "valor_original": valor_divida,
         "desconto_avista_percentual": desconto,
         "valor_avista": valor_avista,
-        "parcelamentos": opcoes_parcelamento,
+        "parcelamentos": parcelamentos,
     }
 
+
+# =========================================================
+# ENDPOINTS
+# =========================================================
 
 @app.get("/")
 def status_api():
     return {
         "status": "online",
         "servico": "MoveBank Recovery API",
-        "versao": "1.1.0",
+        "versao": "1.2.0",
+        "data_hora": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -166,23 +204,25 @@ def consultar_cliente(cpf: str):
 
 
 @app.post("/webhook/moveo")
-async def receber_webhook_moveo(request: Request) -> dict[str, Any]:
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
+async def receber_webhook_moveo(
+    payload_model: MoveoWebhookPayload,
+    request: Request,
+) -> dict[str, Any]:
+
+    payload = payload_model.model_dump()
 
     print("\n========== WEBHOOK MOVEO ==========")
     print("Payload recebido:", payload)
+    print("Headers recebidos:", dict(request.headers))
     print("===================================\n")
 
-    # Tenta obter o CPF salvo no ID externo.
     contexto = payload.get("context", {})
-    usuario = contexto.get("user", {})
+    usuario = contexto.get("user") or {}
 
-    cpf = limpar_cpf(str(usuario.get("external_id", "")))
+    cpf = limpar_cpf(
+        str(usuario.get("external_id", ""))
+    )
 
-    # Caso não esteja no external_id, procura no JSON inteiro.
     if len(cpf) != 11:
         cpf_encontrado = localizar_cpf_no_payload(payload)
         cpf = cpf_encontrado or ""
@@ -193,8 +233,10 @@ async def receber_webhook_moveo(request: Request) -> dict[str, Any]:
                 {
                     "type": "text",
                     "texts": [
-                        "Não consegui identificar o CPF informado. "
-                        "Digite apenas os 11 números do CPF."
+                        (
+                            "Não consegui identificar o CPF informado. "
+                            "Digite apenas os 11 números do CPF."
+                        )
                     ],
                 }
             ],
@@ -211,8 +253,11 @@ async def receber_webhook_moveo(request: Request) -> dict[str, Any]:
                 {
                     "type": "text",
                     "texts": [
-                        "Não localizei uma negociação para o CPF informado. "
-                        "Posso encaminhar você para um especialista."
+                        (
+                            "Não localizei uma negociação disponível "
+                            "para o CPF informado. Posso encaminhar "
+                            "você para um especialista."
+                        )
                     ],
                 }
             ],
@@ -225,20 +270,23 @@ async def receber_webhook_moveo(request: Request) -> dict[str, Any]:
     oferta = calcular_oferta(cliente)
 
     parcelas_texto = ", ".join(
-        f"{opcao['quantidade']}x de "
-        f"{formatar_moeda(opcao['valor_parcela'])}"
+        (
+            f"{opcao['quantidade']}x de "
+            f"{formatar_moeda(opcao['valor_parcela'])}"
+        )
         for opcao in oferta["parcelamentos"]
     )
 
     mensagem = (
-        f"Olá, {cliente['nome']}. Localizei um débito de "
-        f"{formatar_moeda(cliente['valor_divida'])}, com "
-        f"{cliente['dias_atraso']} dias de atraso. "
+        f"Olá, {cliente['nome']}. "
+        f"Localizei um débito de "
+        f"{formatar_moeda(cliente['valor_divida'])}, "
+        f"com {cliente['dias_atraso']} dias de atraso. "
         f"Para pagamento à vista, o valor simulado é "
-        f"{formatar_moeda(oferta['valor_avista'])}, com "
-        f"{oferta['desconto_avista_percentual']}% de desconto. "
-        f"Também temos: {parcelas_texto}. "
-        "Qual opção você prefere?"
+        f"{formatar_moeda(oferta['valor_avista'])}, "
+        f"com {oferta['desconto_avista_percentual']}% de desconto. "
+        f"Também temos as opções: {parcelas_texto}. "
+        f"Qual opção você prefere?"
     )
 
     return {
@@ -254,5 +302,6 @@ async def receber_webhook_moveo(request: Request) -> dict[str, Any]:
             "cpf_consultado": cpf,
             "valor_divida": cliente["valor_divida"],
             "valor_avista": oferta["valor_avista"],
+            "dias_atraso": cliente["dias_atraso"],
         },
     }
