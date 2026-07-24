@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 app = FastAPI(
     title="MoveBank Recovery API",
     description="API simulada para integração com o agente MoveBank Recovery AI",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -74,8 +74,13 @@ class MoveoContext(BaseModel):
     user: MoveoUser | None = None
 
 
+class MoveoInput(BaseModel):
+    text: str = ""
+
+
 class MoveoWebhookPayload(BaseModel):
     context: MoveoContext = Field(default_factory=MoveoContext)
+    input: MoveoInput = Field(default_factory=MoveoInput)
 
 
 # =========================================================
@@ -83,7 +88,11 @@ class MoveoWebhookPayload(BaseModel):
 # =========================================================
 
 def limpar_cpf(valor: str) -> str:
-    return "".join(caractere for caractere in valor if caractere.isdigit())
+    return "".join(
+        caractere
+        for caractere in valor
+        if caractere.isdigit()
+    )
 
 
 def localizar_cpf_em_texto(texto: str) -> str | None:
@@ -112,17 +121,20 @@ def localizar_cpf_no_payload(valor: Any) -> str | None:
         ):
             if chave in valor:
                 cpf = localizar_cpf_no_payload(valor[chave])
+
                 if cpf:
                     return cpf
 
         for conteudo in valor.values():
             cpf = localizar_cpf_no_payload(conteudo)
+
             if cpf:
                 return cpf
 
     if isinstance(valor, list):
         for item in valor:
             cpf = localizar_cpf_no_payload(item)
+
             if cpf:
                 return cpf
 
@@ -168,6 +180,21 @@ def calcular_oferta(cliente: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def resposta_texto(
+    texto: str,
+    contexto: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "responses": [
+            {
+                "type": "text",
+                "texts": [texto],
+            }
+        ],
+        "context": contexto,
+    }
+
+
 # =========================================================
 # ENDPOINTS
 # =========================================================
@@ -177,7 +204,7 @@ def status_api():
     return {
         "status": "online",
         "servico": "MoveBank Recovery API",
-        "versao": "1.2.0",
+        "versao": "1.3.0",
         "data_hora": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -216,6 +243,14 @@ async def receber_webhook_moveo(
     print("Headers recebidos:", dict(request.headers))
     print("===================================\n")
 
+    texto_usuario = (
+        payload
+        .get("input", {})
+        .get("text", "")
+        .lower()
+        .strip()
+    )
+
     contexto = payload.get("context", {})
     usuario = contexto.get("user") or {}
 
@@ -228,46 +263,158 @@ async def receber_webhook_moveo(
         cpf = cpf_encontrado or ""
 
     if len(cpf) != 11:
-        return {
-            "responses": [
-                {
-                    "type": "text",
-                    "texts": [
-                        (
-                            "Não consegui identificar o CPF informado. "
-                            "Digite apenas os 11 números do CPF."
-                        )
-                    ],
-                }
-            ],
-            "context": {
+        return resposta_texto(
+            (
+                "Não consegui identificar o CPF informado. "
+                "Digite apenas os 11 números do CPF."
+            ),
+            {
                 "consulta_status": "cpf_invalido",
             },
-        }
+        )
 
     cliente = clientes.get(cpf)
 
     if cliente is None:
-        return {
-            "responses": [
-                {
-                    "type": "text",
-                    "texts": [
-                        (
-                            "Não localizei uma negociação disponível "
-                            "para o CPF informado. Posso encaminhar "
-                            "você para um especialista."
-                        )
-                    ],
-                }
-            ],
-            "context": {
+        return resposta_texto(
+            (
+                "Não localizei uma negociação disponível "
+                "para o CPF informado. Posso encaminhar "
+                "você para um especialista."
+            ),
+            {
                 "consulta_status": "cliente_nao_encontrado",
                 "cpf_consultado": cpf,
             },
-        }
+        )
 
     oferta = calcular_oferta(cliente)
+
+    # =====================================================
+    # ENCERRAMENTO: PAGAMENTO À VISTA
+    # =====================================================
+
+    if any(
+        termo in texto_usuario
+        for termo in (
+            "à vista",
+            "a vista",
+            "avista",
+            "pagamento à vista",
+            "pagamento a vista",
+        )
+    ):
+        return resposta_texto(
+            (
+                f"Perfeito, {cliente['nome']}. "
+                "Registrei sua opção de pagamento à vista "
+                f"no valor de {formatar_moeda(oferta['valor_avista'])}. "
+                "Agora vou gerar o boleto bancário e ele será "
+                "enviado pelos canais cadastrados. "
+                "Obrigado por negociar com o MoveBank!"
+            ),
+            {
+                "negociacao_status": "concluida",
+                "modalidade": "avista",
+                "cliente_nome": cliente["nome"],
+                "cpf_consultado": cpf,
+                "valor_acordo": oferta["valor_avista"],
+            },
+        )
+
+    # =====================================================
+    # ENCERRAMENTO: PAGAMENTO PARCELADO
+    # =====================================================
+
+    for opcao in oferta["parcelamentos"]:
+        quantidade = opcao["quantidade"]
+
+        if (
+            f"{quantidade}x" in texto_usuario
+            or f"{quantidade} parcelas" in texto_usuario
+            or f"em {quantidade}" in texto_usuario
+            or f"{quantidade} vezes" in texto_usuario
+        ):
+            return resposta_texto(
+                (
+                    f"Perfeito, {cliente['nome']}. "
+                    f"Registrei sua negociação em {quantidade} parcelas "
+                    f"de {formatar_moeda(opcao['valor_parcela'])}. "
+                    "Agora vou gerar o boleto da primeira parcela "
+                    "e ele será enviado pelos canais cadastrados. "
+                    "Agradecemos por negociar com o MoveBank!"
+                ),
+                {
+                    "negociacao_status": "concluida",
+                    "modalidade": "parcelado",
+                    "cliente_nome": cliente["nome"],
+                    "cpf_consultado": cpf,
+                    "quantidade_parcelas": quantidade,
+                    "valor_parcela": opcao["valor_parcela"],
+                },
+            )
+
+    # =====================================================
+    # DIFICULDADE FINANCEIRA
+    # =====================================================
+
+    if any(
+        termo in texto_usuario
+        for termo in (
+            "desempregado",
+            "sem emprego",
+            "não consigo pagar",
+            "nao consigo pagar",
+            "sem dinheiro",
+            "não tenho dinheiro",
+            "nao tenho dinheiro",
+        )
+    ):
+        return resposta_texto(
+            (
+                f"Entendo sua situação, {cliente['nome']}. "
+                "Posso encaminhar seu contrato para análise "
+                "de uma condição especial de negociação. "
+                "Também posso direcionar você para um especialista humano."
+            ),
+            {
+                "consulta_status": "dificuldade_financeira",
+                "cliente_nome": cliente["nome"],
+                "cpf_consultado": cpf,
+            },
+        )
+
+    # =====================================================
+    # SOLICITAÇÃO DE ATENDENTE
+    # =====================================================
+
+    if any(
+        termo in texto_usuario
+        for termo in (
+            "atendente",
+            "humano",
+            "especialista",
+            "falar com alguém",
+            "falar com alguem",
+        )
+    ):
+        return resposta_texto(
+            (
+                "Certo. Vou encaminhar sua solicitação "
+                "para um especialista humano, que continuará "
+                "o atendimento com as informações desta negociação. "
+                "Obrigado pelo contato."
+            ),
+            {
+                "consulta_status": "solicitou_atendente",
+                "cliente_nome": cliente["nome"],
+                "cpf_consultado": cpf,
+            },
+        )
+
+    # =====================================================
+    # RESPOSTA INICIAL: APRESENTAÇÃO DAS OFERTAS
+    # =====================================================
 
     parcelas_texto = ", ".join(
         (
@@ -286,17 +433,12 @@ async def receber_webhook_moveo(
         f"{formatar_moeda(oferta['valor_avista'])}, "
         f"com {oferta['desconto_avista_percentual']}% de desconto. "
         f"Também temos as opções: {parcelas_texto}. "
-        f"Qual opção você prefere?"
+        "Você prefere pagar à vista ou parcelado?"
     )
 
-    return {
-        "responses": [
-            {
-                "type": "text",
-                "texts": [mensagem],
-            }
-        ],
-        "context": {
+    return resposta_texto(
+        mensagem,
+        {
             "consulta_status": "cliente_localizado",
             "cliente_nome": cliente["nome"],
             "cpf_consultado": cpf,
@@ -304,4 +446,4 @@ async def receber_webhook_moveo(
             "valor_avista": oferta["valor_avista"],
             "dias_atraso": cliente["dias_atraso"],
         },
-    }
+    )
